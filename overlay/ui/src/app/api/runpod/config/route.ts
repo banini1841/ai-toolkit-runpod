@@ -5,7 +5,9 @@ import { PrismaClient } from '@prisma/client';
 // Settings table (no schema change). New file, so it survives upstream git pulls.
 const prisma = new PrismaClient();
 
-export const RUNPOD_SETTING_KEYS = ['RUNPOD_API_KEY', 'RUNPOD_SSH_KEY_PATH'] as const;
+// NOTE: Next.js route modules may only export route handlers (GET/POST/...),
+// so this stays a local (non-exported) const.
+const RUNPOD_SETTING_KEYS = ['RUNPOD_API_KEY', 'RUNPOD_SSH_KEY_PATH'] as const;
 
 const DEFAULTS: Record<string, string> = {
   RUNPOD_API_KEY: '',
