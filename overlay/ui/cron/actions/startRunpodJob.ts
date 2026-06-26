@@ -101,6 +101,7 @@ export default async function maybeStartRunpodJob(job: Job): Promise<boolean> {
     const subprocess = spawn(pythonPath, args, {
       detached: true,
       stdio: 'ignore',
+      windowsHide: true,
       env: { ...process.env, ...additionalEnv },
       cwd: TOOLKIT_ROOT,
     });

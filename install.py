@@ -64,14 +64,25 @@ HOOKS = [
 
 def detect_target(explicit):
     if explicit:
-        return os.path.abspath(explicit)
-    env = os.environ.get("AI_TOOLKIT_DIR")
-    if env:
-        return os.path.abspath(env)
+        return os.path.abspath(os.path.expanduser(explicit))
+    # auto-detect: an ai-toolkit folder sitting next to this repo
     cand = os.path.abspath(os.path.join(HERE, "..", "ai-toolkit"))
-    if os.path.isdir(cand):
-        return cand
-    return None
+    return cand if valid_target(cand) else None
+
+
+def prompt_for_target():
+    """Ask for the ai-toolkit path interactively when it can't be auto-detected."""
+    if not sys.stdin.isatty():
+        return None
+    print("Could not auto-detect your ai-toolkit folder.")
+    while True:
+        ans = input("Path to your ai-toolkit folder (blank to cancel): ").strip()
+        if not ans:
+            return None
+        path = os.path.abspath(os.path.expanduser(ans))
+        if valid_target(path):
+            return path
+        print(f"  '{path}' doesn't look like ai-toolkit (need ui/ and run.py). Try again.")
 
 
 def valid_target(target):
@@ -80,8 +91,11 @@ def valid_target(target):
 
 def copy_overlay(target):
     print("Copying extension files:")
-    for root, _, files in os.walk(OVERLAY):
+    for root, dirs, files in os.walk(OVERLAY):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
         for fn in files:
+            if fn.endswith(".pyc"):
+                continue
             src = os.path.join(root, fn)
             rel = os.path.relpath(src, OVERLAY)
             dst = os.path.join(target, rel)
@@ -122,7 +136,9 @@ def main():
     args = ap.parse_args()
 
     target = detect_target(args.ai_toolkit)
-    if not valid_target(target):
+    if not (target and valid_target(target)):
+        target = prompt_for_target()
+    if not (target and valid_target(target)):
         print("ERROR: could not find a valid ai-toolkit checkout.")
         print("Pass it explicitly:  python install.py --ai-toolkit /path/to/ai-toolkit")
         return 1

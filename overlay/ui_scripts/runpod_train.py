@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """RunPod remote-training orchestrator for the ai-toolkit UI extension.
 
-Adapted from the standalone trainer at Runpod_Trainer/Linux/TrainV4.py, but made
-non-interactive and driven by an ai-toolkit *job config JSON* (the same file the
-local trainer uses). It:
+Cross-platform (Linux / macOS / Windows). Adapted from the standalone trainer
+Runpod_Trainer/Linux/TrainV4.py, but non-interactive and driven by an ai-toolkit
+*job config JSON* (the same file the local trainer uses). It:
 
   1. Creates a RunPod pod (GPU/cloud/disk taken from config.process[0].runpod).
   2. Installs ai-toolkit on the pod and uploads dataset(s) + a rewritten config.
   3. Runs `run.py` on the pod (non-UI mode, but keeps use_ui_logger so the pod
      writes loss_log.db + samples + checkpoints).
-  4. Streams the remote log into the local log file, rsyncs the remote output
+  4. Streams the remote log into the local log file, syncs the remote output
      folder back into the local job folder, and updates the local aitk_db.db Job
      row (step / status / speed) — so the existing UI widgets keep working.
   5. Tears the pod down on completion, error, stop (DB flag) or SIGINT/SIGTERM.
+
+`ssh`/`scp` are invoked as argument lists (no shell), so the same code runs on
+Windows (built-in OpenSSH) and POSIX. `rsync` is used when present, else `scp`.
+A pod-id sidecar file + `--reap` mode guard against leaked (still-billing) pods
+if the orchestrator is hard-killed (e.g. Windows `taskkill /F` on Stop).
 
 This is a NEW file under ui_scripts/, so it survives upstream `git pull`s.
 Invoked by ui/cron/actions/startRunpodJob.ts.
@@ -23,7 +28,7 @@ import base64
 import copy
 import json
 import os
-import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -36,19 +41,22 @@ import time
 # Arguments / globals
 # --------------------------------------------------------------------------- #
 parser = argparse.ArgumentParser(description="RunPod remote training orchestrator")
-parser.add_argument("--config", required=True, help="Path to the ai-toolkit job config JSON")
-parser.add_argument("--log", required=True, help="Local log file to write to")
-parser.add_argument("--job-id", required=True, help="aitk Job id")
-parser.add_argument("--db", required=True, help="Path to aitk_db.db")
-parser.add_argument("--name", required=True, help="Job name")
+parser.add_argument("--config", help="Path to the ai-toolkit job config JSON")
+parser.add_argument("--log", help="Local log file to write to")
+parser.add_argument("--job-id", help="aitk Job id")
+parser.add_argument("--db", help="Path to aitk_db.db")
+parser.add_argument("--name", help="Job name")
 parser.add_argument("--training-folder", required=True, help="Local training root folder")
+parser.add_argument("--reap", action="store_true",
+                    help="Terminate any leaked pods recorded under --training-folder, then exit")
 args = parser.parse_args()
 
 JOB_ID = args.job_id
 DB_PATH = args.db
 JOB_NAME = args.name
-LOCAL_JOB_FOLDER = os.path.join(args.training_folder, JOB_NAME)
 LOCAL_LOG = args.log
+LOCAL_JOB_FOLDER = os.path.join(args.training_folder, JOB_NAME) if JOB_NAME else None
+SIDECAR = os.path.join(LOCAL_JOB_FOLDER, ".runpod_pod.json") if LOCAL_JOB_FOLDER else None
 
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "")
 SSH_KEY_PATH = os.path.expanduser(os.getenv("RUNPOD_SSH_KEY_PATH", "~/.ssh/id_ed25519"))
@@ -62,7 +70,7 @@ REMOTE_TOOLKIT = f"{REMOTE_WORKSPACE}/ai-toolkit"
 REMOTE_ENV_FILE = f"{REMOTE_TOOLKIT}/.env"
 REMOTE_CONFIG = f"{REMOTE_TOOLKIT}/.runpod_job_config.json"
 REMOTE_OUTPUT_ROOT = f"{REMOTE_TOOLKIT}/output"
-REMOTE_SAVE_ROOT = f"{REMOTE_OUTPUT_ROOT}/{JOB_NAME}"
+REMOTE_SAVE_ROOT = f"{REMOTE_OUTPUT_ROOT}/{JOB_NAME}" if JOB_NAME else ""
 LOG_FILE = f"{REMOTE_WORKSPACE}/training_run.log"
 REMOTE_PID_FILE = f"{REMOTE_WORKSPACE}/train.pid"
 REMOTE_EXIT_FILE = f"{REMOTE_WORKSPACE}/train_exit"
@@ -75,7 +83,7 @@ POD_ID = ""
 
 _stop_event = threading.Event()
 _log_lock = threading.Lock()
-_known_hosts = os.path.join(tempfile.gettempdir(), f"aitk_runpod_known_hosts_{JOB_ID}")
+_known_hosts = os.path.join(tempfile.gettempdir(), f"aitk_runpod_known_hosts_{JOB_ID or 'reap'}")
 
 runpod = None  # lazily imported
 
@@ -86,6 +94,8 @@ runpod = None  # lazily imported
 def log(msg: str):
     line = f"[runpod] {msg}"
     print(line, flush=True)
+    if not LOCAL_LOG:
+        return
     with _log_lock:
         try:
             with open(LOCAL_LOG, "a", encoding="utf-8") as f:
@@ -98,7 +108,7 @@ def log(msg: str):
 # Local DB updates (aitk_db.db Job row) — table name is "Job"
 # --------------------------------------------------------------------------- #
 def db_update(**fields):
-    if not fields:
+    if not fields or not DB_PATH:
         return
     try:
         con = sqlite3.connect(DB_PATH, timeout=15.0, isolation_level=None)
@@ -110,6 +120,8 @@ def db_update(**fields):
 
 
 def db_should_stop() -> bool:
+    if not DB_PATH:
+        return False
     try:
         con = sqlite3.connect(DB_PATH, timeout=15.0)
         cur = con.execute("SELECT stop, return_to_queue FROM Job WHERE id = ?", (JOB_ID,))
@@ -123,44 +135,39 @@ def db_should_stop() -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# SSH / SCP helpers (adapted from TrainV4.py)
+# SSH / SCP helpers — argument lists (no shell), so they work on Windows too
 # --------------------------------------------------------------------------- #
-def _ssh_opts() -> str:
-    return (
-        f"-q -p {POD_PORT} -o ConnectTimeout=15 -o LogLevel=ERROR "
-        f"-o StrictHostKeyChecking=no -o UserKnownHostsFile={shlex.quote(_known_hosts)} "
-        f"-i {shlex.quote(SSH_KEY_PATH)}"
-    )
+def _conn_opts(for_scp=False):
+    port_flag = "-P" if for_scp else "-p"
+    return [
+        port_flag, str(POD_PORT),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", f"UserKnownHostsFile={_known_hosts}",
+        "-o", "ConnectTimeout=15",
+        "-o", "LogLevel=ERROR",
+        "-i", SSH_KEY_PATH,
+    ]
 
 
-def ssh(remote_cmd: str, check=True, capture=True):
-    user_host = f"{POD_USER}@{POD_IP}"
-    cmd = f"ssh {_ssh_opts()} {shlex.quote(user_host)} {shlex.quote(remote_cmd)}"
-    res = subprocess.run(cmd, shell=True, capture_output=capture, text=True,
-                         encoding="utf-8", errors="replace")
+def ssh(remote_cmd: str, check=True):
+    """Run a command on the pod. `remote_cmd` is a single string interpreted by
+    the pod's (bash) shell — local OS never parses it."""
+    argv = ["ssh", "-q", *_conn_opts(), f"{POD_USER}@{POD_IP}", remote_cmd]
+    res = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check and res.returncode != 0:
         raise RuntimeError(f"Remote command failed ({res.returncode}): {remote_cmd}\n{res.stderr}")
     return res.returncode, (res.stdout or "")
 
 
 def scp(local_path: str, remote_path: str, upload=True, is_dir=False, check=True):
-    user_host = f"{POD_USER}@{POD_IP}"
-    flags = (
-        f"-P {POD_PORT} -q -o StrictHostKeyChecking=no "
-        f"-o UserKnownHostsFile={shlex.quote(_known_hosts)} -i {shlex.quote(SSH_KEY_PATH)}"
-    )
+    argv = ["scp", "-q", *_conn_opts(for_scp=True)]
     if is_dir:
-        flags += " -r"
-    remote_spec = f"{user_host}:{shlex.quote(remote_path)}"
-    if upload:
-        src, dst = shlex.quote(local_path), remote_spec
-    else:
-        src, dst = remote_spec, shlex.quote(local_path)
-    cmd = f"scp {flags} {src} {dst}"
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                         encoding="utf-8", errors="replace")
+        argv.append("-r")
+    remote_spec = f"{POD_USER}@{POD_IP}:{remote_path}"
+    argv += ([local_path, remote_spec] if upload else [remote_spec, local_path])
+    res = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check and res.returncode != 0:
-        raise RuntimeError(f"SCP failed ({res.returncode}): {cmd}\n{res.stderr}")
+        raise RuntimeError(f"SCP failed ({res.returncode}): {' '.join(argv)}\n{res.stderr}")
     return res.returncode
 
 
@@ -179,7 +186,7 @@ def wait_for_ssh(max_wait=420, delay=15) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# RunPod SDK (lazy install/import) + pod lifecycle
+# RunPod SDK (lazy install/import) + pod lifecycle + leak-guard sidecar
 # --------------------------------------------------------------------------- #
 def ensure_runpod():
     global runpod
@@ -191,6 +198,44 @@ def ensure_runpod():
         import runpod as _rp
     runpod = _rp
     runpod.api_key = RUNPOD_API_KEY
+
+
+def write_sidecar():
+    if not SIDECAR:
+        return
+    try:
+        os.makedirs(LOCAL_JOB_FOLDER, exist_ok=True)
+        with open(SIDECAR, "w") as f:
+            json.dump({"pod_id": POD_ID}, f)
+    except Exception:
+        pass
+
+
+def clear_sidecar():
+    if SIDECAR and os.path.exists(SIDECAR):
+        try:
+            os.remove(SIDECAR)
+        except Exception:
+            pass
+
+
+def reap_sidecar(path: str):
+    """Terminate the pod recorded in a sidecar file, then delete the file."""
+    try:
+        with open(path) as f:
+            pid = json.load(f).get("pod_id")
+    except Exception:
+        pid = None
+    if pid:
+        log(f"Reaping leftover pod {pid} ({path})")
+        try:
+            runpod.terminate_pod(pid)
+        except Exception as e:
+            log(f"reap error for {pid}: {e}")
+    try:
+        os.remove(path)
+    except Exception:
+        pass
 
 
 def create_pod(runpod_cfg: dict):
@@ -223,10 +268,10 @@ def create_pod(runpod_cfg: dict):
         raise last_exc or RuntimeError("create_pod timed out")
     if not POD_ID:
         raise RuntimeError("No pod id returned from create_pod")
+    write_sidecar()  # record immediately so a hard-kill can't leak this pod
     log(f"Pod created: {POD_ID}")
     db_update(info=f"Pod {POD_ID} created, waiting for SSH ...")
 
-    # Fetch SSH connection details
     for attempt in range(24):
         if _stop_event.is_set():
             raise RuntimeError("Stopped while fetching pod details")
@@ -249,12 +294,14 @@ def create_pod(runpod_cfg: dict):
 
 def terminate_pod():
     if not POD_ID or runpod is None:
+        clear_sidecar()
         return
     log(f"Terminating pod {POD_ID} ...")
     try:
         runpod.terminate_pod(POD_ID)
     except Exception as e:
         log(f"terminate_pod error (will not retry): {e}")
+    clear_sidecar()
 
 
 # --------------------------------------------------------------------------- #
@@ -265,32 +312,26 @@ def build_remote_config(job_config: dict):
     cfg = copy.deepcopy(job_config)
     proc = cfg["config"]["process"][0]
 
-    # Pod runs in non-UI mode; keep use_ui_logger so loss_log.db is still written.
     proc["sqlite_db_path"] = "./aitk_db.db"
     proc["training_folder"] = REMOTE_OUTPUT_ROOT
     proc["device"] = "cuda"
-    proc.pop("runpod", None)  # not needed on the pod
+    proc.pop("runpod", None)
 
-    # Remap each dataset folder to a remote path; collect uploads (dedup by path).
     uploads = []
     remote_by_local = {}
-    datasets = proc.get("datasets", []) or []
-    for ds in datasets:
+    for ds in proc.get("datasets", []) or []:
         local = ds.get("folder_path")
         if not local:
             continue
         if local not in remote_by_local:
             idx = len(remote_by_local)
-            remote = f"{REMOTE_WORKSPACE}/dataset_{idx}"
-            remote_by_local[local] = remote
-            uploads.append((local, remote))
+            remote_by_local[local] = f"{REMOTE_WORKSPACE}/dataset_{idx}"
+            uploads.append((local, remote_by_local[local]))
         ds["folder_path"] = remote_by_local[local]
-        # control/mask paths are not uploaded in this version
         if ds.get("mask_path"):
-            log(f"WARNING: dataset mask_path '{ds['mask_path']}' is not uploaded to the pod and will be ignored.")
+            log(f"WARNING: dataset mask_path '{ds['mask_path']}' is not uploaded and will be ignored.")
             ds["mask_path"] = None
 
-    # Warn (don't fail) about local model paths that won't exist on the pod.
     name_or_path = proc.get("model", {}).get("name_or_path", "")
     if name_or_path and os.path.exists(name_or_path):
         log(f"WARNING: model name_or_path '{name_or_path}' is a local path. It is NOT uploaded; "
@@ -300,14 +341,13 @@ def build_remote_config(job_config: dict):
 
 
 # --------------------------------------------------------------------------- #
-# Remote log streamer + output sync (background threads)
+# Remote log streamer + output sync (background-friendly)
 # --------------------------------------------------------------------------- #
 def stream_remote_log():
-    """Append new bytes of the remote LOG_FILE into the local log file."""
     offset = 1  # tail -c +N is 1-indexed
     while not _stop_event.is_set():
         try:
-            rc, out = ssh(f"tail -c +{offset} {shlex.quote(LOG_FILE)} 2>/dev/null", check=False)
+            rc, out = ssh(f"tail -c +{offset} {LOG_FILE} 2>/dev/null", check=False)
             if rc == 0 and out:
                 with _log_lock:
                     with open(LOCAL_LOG, "a", encoding="utf-8") as f:
@@ -318,28 +358,19 @@ def stream_remote_log():
         _stop_event.wait(5)
 
 
-def has_rsync_local() -> bool:
-    return subprocess.run("command -v rsync", shell=True, capture_output=True).returncode == 0
-
-
 def sync_outputs():
     """Pull the remote save folder into the local job folder (rsync, scp fallback)."""
     os.makedirs(LOCAL_JOB_FOLDER, exist_ok=True)
-    use_rsync = has_rsync_local()
-    if use_rsync:
-        ssh_e = (
-            f"ssh -p {POD_PORT} -o StrictHostKeyChecking=no "
-            f"-o UserKnownHostsFile={shlex.quote(_known_hosts)} -i {shlex.quote(SSH_KEY_PATH)}"
-        )
-        cmd = (
-            f"rsync -az --timeout=60 -e {shlex.quote(ssh_e)} "
-            f"{shlex.quote(POD_USER + '@' + POD_IP + ':' + REMOTE_SAVE_ROOT + '/')} "
-            f"{shlex.quote(LOCAL_JOB_FOLDER + '/')}"
-        )
-        rc = subprocess.run(cmd, shell=True, capture_output=True, text=True).returncode
-        if rc == 0:
+    if shutil.which("rsync"):
+        ssh_e = "ssh " + " ".join(_conn_opts())
+        argv = [
+            "rsync", "-az", "--timeout=60", "-e", ssh_e,
+            f"{POD_USER}@{POD_IP}:{REMOTE_SAVE_ROOT}/",
+            LOCAL_JOB_FOLDER + os.sep,
+        ]
+        if subprocess.run(argv, capture_output=True, text=True).returncode == 0:
             return
-        # fall through to scp on rsync failure (e.g. rsync missing on pod)
+        # fall through to scp if rsync failed (e.g. rsync missing on the pod)
     try:
         scp(args.training_folder, REMOTE_SAVE_ROOT, upload=False, is_dir=True, check=False)
     except Exception as e:
@@ -347,14 +378,12 @@ def sync_outputs():
 
 
 def read_progress_step():
-    """Current step = MAX(step) from the synced loss_log.db, if present."""
     loss_db = os.path.join(LOCAL_JOB_FOLDER, "loss_log.db")
     if not os.path.exists(loss_db):
         return None
     try:
         con = sqlite3.connect(loss_db, timeout=10.0)
-        cur = con.execute("SELECT MAX(step) FROM steps")
-        row = cur.fetchone()
+        row = con.execute("SELECT MAX(step) FROM steps").fetchone()
         con.close()
         if row and row[0] is not None:
             return int(row[0])
@@ -388,7 +417,6 @@ def setup_toolkit():
 
 def upload_inputs(remote_config: dict, uploads):
     db_update(info="Uploading dataset and config ...")
-    # HF token .env
     if HF_TOKEN:
         tmp_env = os.path.join(tempfile.gettempdir(), f"aitk_env_{JOB_ID}")
         with open(tmp_env, "w") as f:
@@ -405,7 +433,6 @@ def upload_inputs(remote_config: dict, uploads):
         log(f"Uploading dataset {local} -> {remote}")
         scp(local, remote, upload=True, is_dir=True, check=True)
 
-    # config
     tmp_cfg = os.path.join(tempfile.gettempdir(), f"aitk_cfg_{JOB_ID}.json")
     with open(tmp_cfg, "w") as f:
         json.dump(remote_config, f, indent=2)
@@ -452,7 +479,6 @@ def monitor(total_steps, poll=15, disconnect_grace=1800):
         try:
             rc, out = ssh(check, check=True)
         except Exception as e:
-            # Connection lost — keep retrying (training survives via nohup).
             if disconnect_since is None:
                 disconnect_since = time.time()
                 log(f"Connection to pod lost ({e}). Training continues on the pod (nohup); "
@@ -501,9 +527,50 @@ def _signal_handler(signum, frame):
     _stop_event.set()
 
 
+def _stop_watcher():
+    """Cross-platform stop: poll the DB stop flag (works even where Unix signals
+    don't), so Stop is honored during long setup phases too."""
+    while not _stop_event.is_set():
+        if db_should_stop():
+            _stop_event.set()
+            return
+        _stop_event.wait(4)
+
+
+def run_reap():
+    ensure_runpod()
+    root = args.training_folder
+    count = 0
+    try:
+        for name in os.listdir(root):
+            sc = os.path.join(root, name, ".runpod_pod.json")
+            if os.path.isfile(sc):
+                reap_sidecar(sc)
+                count += 1
+    except FileNotFoundError:
+        pass
+    log(f"Reap complete ({count} sidecar(s) processed).")
+    return 0
+
+
 def main():
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
+    if args.reap:
+        if not RUNPOD_API_KEY:
+            print("[runpod] RUNPOD_API_KEY not set", flush=True)
+            return 1
+        return run_reap()
+
+    missing = [n for n in ("config", "log", "job_id", "db", "name") if not getattr(args, n)]
+    if missing:
+        print(f"[runpod] missing required args: {', '.join('--' + m.replace('_', '-') for m in missing)}", flush=True)
+        return 2
+
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, _signal_handler)
+            except (ValueError, OSError):
+                pass  # not all signals are settable on every platform/thread
 
     if not RUNPOD_API_KEY:
         db_update(status="error", info="RUNPOD_API_KEY not set")
@@ -523,15 +590,19 @@ def main():
 
     remote_config, uploads = build_remote_config(job_config)
 
+    threading.Thread(target=_stop_watcher, daemon=True).start()
+
     log_thread = None
     result = "error"
     try:
         ensure_runpod()
+        # reap a pod left over from a prior hard-killed run of THIS job, if any
+        if SIDECAR and os.path.exists(SIDECAR):
+            reap_sidecar(SIDECAR)
         create_pod(runpod_cfg)
         if not wait_for_ssh():
             raise RuntimeError("SSH did not become ready")
 
-        # start streaming the remote log as soon as the pod is reachable
         log_thread = threading.Thread(target=stream_remote_log, daemon=True)
         log_thread.start()
 
@@ -544,7 +615,6 @@ def main():
             launch_training()
             result = monitor(total_steps)
 
-        # final pull of outputs
         try:
             sync_outputs()
         except Exception:
@@ -566,7 +636,6 @@ def main():
         _stop_event.set()
         if log_thread:
             log_thread.join(timeout=3)
-        # best-effort final pull so even a crash leaves the latest checkpoints local
         if POD_IP:
             try:
                 sync_outputs()

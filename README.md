@@ -13,17 +13,30 @@ base PyTorch image, clones ai-toolkit, and runs your **exact** job config there.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/ai-toolkit-runpod.git
+git clone https://github.com/banini1841/ai-toolkit-runpod.git
 cd ai-toolkit-runpod
-python install.py --ai-toolkit /path/to/ai-toolkit
-# then restart the UI:  cd /path/to/ai-toolkit/ui && npm run build_and_start
+
+./install.sh        # Linux / macOS
+install.bat         # Windows
 ```
 
+The installer auto-detects an `ai-toolkit` folder sitting next to this repo; if it
+can't find one it **prompts you for the path** (nothing to add to PATH). You can
+also pass it directly:
+
+```bash
+./install.sh --ai-toolkit /path/to/ai-toolkit        # Linux / macOS
+install.bat  --ai-toolkit C:\path\to\ai-toolkit       # Windows
+```
+
+The `.sh`/`.bat` wrappers just call `install.py`; run `python install.py` directly
+if you prefer. Afterwards restart the UI: `cd <ai-toolkit>/ui && npm run build_and_start`.
+
 The installer **copies new files** into ai-toolkit and applies **two tiny hooks**
-to existing files (`SimpleJob.tsx`, `cron/actions/startJob.ts`). It is idempotent —
+to existing files (`SimpleJob.tsx`, `cron/actions/startJob.ts`). It's idempotent —
 re-run it any time, including after you `git pull` ai-toolkit, to re-apply the hooks.
 
-Uninstall with `python uninstall.py --ai-toolkit /path/to/ai-toolkit`.
+Uninstall with `./uninstall.sh` (or `uninstall.bat`).
 
 ### Why an installer instead of a fork
 
@@ -55,13 +68,34 @@ then start the job/queue.
   the pod into the local job folder every poll (~15s) and again at the very end, so
   if anything crashes the latest progress is already on your disk.
 - **Auto-terminate** — the pod is always terminated on finish, error, crash or stop
-  (no prompt) to avoid runaway billing.
+  (no prompt) to avoid runaway billing. The pod id is also recorded in a sidecar
+  file the moment it's created, so a hard-killed orchestrator (e.g. Windows
+  `taskkill /F` on Stop) can't permanently leak a billing pod — see Platform notes.
 - **Reconnect** — training runs under `nohup` on the pod, so a dropped SSH
   connection does not stop it. The orchestrator keeps retrying and resumes
   monitoring/syncing when the connection returns (giving up only after ~30 min of
   continuous unreachability, so a dead pod can't hang forever).
 - **Serialized** — RunPod jobs share one queue lane (`gpu_ids = "runpod"`): one pod
   at a time, to keep cost predictable.
+
+## Platform support
+
+Works on **Linux, macOS and Windows**. The orchestrator talks to pods with
+`ssh`/`scp` (called as argument lists, no shell), and uses `rsync` when available
+or `scp` otherwise.
+
+- **Windows** needs the built-in **OpenSSH client** (Windows 10 1809+ ships it;
+  enable via *Settings → Apps → Optional features → OpenSSH Client* if missing).
+- **Stop on Windows:** ai-toolkit stops a job by force-killing the process
+  (`taskkill /F`), which can't run cleanup. The pod is then terminated **the next
+  time you start any RunPod job**, or immediately by running the reaper:
+
+  ```bash
+  python ui_scripts/runpod_train.py --reap --training-folder <your training folder>
+  ```
+
+  (On Linux/macOS, Stop terminates the pod immediately.) Either way you can always
+  see/terminate pods in the RunPod console.
 
 ## Limitations (v1)
 

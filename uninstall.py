@@ -18,14 +18,29 @@ SIMPLEJOB = "ui/src/app/jobs/new/SimpleJob.tsx"
 STARTJOB = "ui/cron/actions/startJob.ts"
 
 
+def valid_target(target):
+    return bool(target) and os.path.isdir(os.path.join(target, "ui")) and os.path.isfile(os.path.join(target, "run.py"))
+
+
 def detect_target(explicit):
     if explicit:
-        return os.path.abspath(explicit)
-    env = os.environ.get("AI_TOOLKIT_DIR")
-    if env:
-        return os.path.abspath(env)
+        return os.path.abspath(os.path.expanduser(explicit))
     cand = os.path.abspath(os.path.join(HERE, "..", "ai-toolkit"))
-    return cand if os.path.isdir(cand) else None
+    return cand if valid_target(cand) else None
+
+
+def prompt_for_target():
+    if not sys.stdin.isatty():
+        return None
+    print("Could not auto-detect your ai-toolkit folder.")
+    while True:
+        ans = input("Path to your ai-toolkit folder (blank to cancel): ").strip()
+        if not ans:
+            return None
+        path = os.path.abspath(os.path.expanduser(ans))
+        if valid_target(path):
+            return path
+        print(f"  '{path}' doesn't look like ai-toolkit (need ui/ and run.py). Try again.")
 
 
 def remove_overlay(target):
@@ -64,7 +79,9 @@ def main():
     ap.add_argument("--ai-toolkit", help="Path to the ai-toolkit checkout")
     args = ap.parse_args()
     target = detect_target(args.ai_toolkit)
-    if not target or not os.path.isdir(target):
+    if not (target and valid_target(target)):
+        target = prompt_for_target()
+    if not (target and valid_target(target)):
         print("ERROR: ai-toolkit checkout not found. Pass --ai-toolkit /path")
         return 1
     print(f"Target ai-toolkit: {target}\n")
