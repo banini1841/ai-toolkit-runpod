@@ -52,10 +52,15 @@ export default function RunpodSection({ jobConfig, setJobConfig, gpuIDs, setGpuI
   // remembers which local GPU was selected before flipping to remote
   const prevLocalGpu = useRef<string | null>(gpuIDs && gpuIDs !== 'runpod' ? gpuIDs : null);
 
-  // Ensure the config carries a runpod block (older/imported configs may not).
+  // Ensure the config carries a runpod block (older/imported configs may not),
+  // and that gpu_ids is the "runpod" sentinel whenever remote training is on at
+  // mount (e.g. editing a RunPod job, or a RunPod-only standalone build).
   useEffect(() => {
     if (!process0.runpod) {
       setJobConfig({ ...DEFAULT_RUNPOD }, 'config.process[0].runpod');
+    }
+    if (enabled && gpuIDs !== 'runpod') {
+      setGpuIDs('runpod');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
